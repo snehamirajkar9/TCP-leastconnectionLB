@@ -89,13 +89,40 @@ The server accepts incoming connections from clients and forwards them to the ap
 3.1 High-Level Architecture
 The high-level architecture explains how requests are redirected to the server with the fewest active connections, requiring additional computation by the load balancer to identify less-busy servers.
 
-
+                           +-------------------------+
+                           |          Client         |
+                           +-----------+-------------+
+                                         |
+                                         v
+                         +-------------------------------+
+                         |            Server             |
+                         +-------------+-----------------+
+                                      |
+                                      v
+        +-----------------------------+------------------------------+
+        |           Authorization & Authentication Layer           |
+        +-----------------------------+------------------------------+
+                                      |
+                                      v
+                            +---------------------+    
+                            |   Load Balancer     |
+                            +-----------+---------+
+                                      |
+                                      v
+                      ----------------------------------------------------------------
+                      | req3,                        |                                   |
+                      v req4                         v                                   v
++--------------------------------+   +--------------------------------+ +--------------------------------+
+|        10 Connections          |   |        80 Conenctions          | |        80 Connections          |
++--------------------------------+   +--------------------------------+ +--------------------------------+
+    Req1, req2 completed
 
 
 Client: Initiates connections to the load balancer.
 Server: Accepts incoming connections from clients and forwards them to the appropriate upstream.
 Library: Implements load balancing and rate limiting functionality.
 Upstreams: Backend servers that handle the actual workload.
+
 3.2 Communication Flow
 Client Connection: Clients establish a connection to the server component of the load balancer.
 Authentication: Mutual TLS authentication is performed between the client and the server to verify identities.
@@ -103,6 +130,7 @@ Authorization: The server checks the authorization of the client and determines 
 Connection Forwarding: The server forwards incoming connections to the appropriate upstream based on load balancing algorithms implemented in the library.
 Rate Limiting: The library component applies per-client connection rate limiting policies to prevent overload on the upstream servers.
 Data Transmission: Data is transmitted between the client and the selected upstream server.
+
 4. Implementation Considerations
 4.1 Language and Framework
 The load balancer and server components will be implemented using a suitable programming language such as Python, Go, or Java. Standard libraries and frameworks will be utilized for implementing TLS, authorization, and communication protocols.
