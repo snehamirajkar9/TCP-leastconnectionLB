@@ -1,151 +1,181 @@
-Design Document: TCP Load Balancer
+# Design document
 
-1. Introduction
-This document outlines the design and architecture of a basic TCP load balancer. The load balancer is designed to distribute network load across multiple hosts (or upstreams) efficiently. The project consists of two main components: a reusable library implementing load balancing functionality and a server that exposes the library functionality, providing secure communication to clients and an authorization layer.
+As requested, the project is broken into 2 components
+- the TCP load balancer library
+- a server that exposes the load balancer functionality and provides secure communication
 
-2. Components
-2.1 Library
-The library component implements the core functionality of the load balancer. It includes two main features: least connections connection forwarder and per-client connection rate limiter.
+The load balancer is written in Go.
 
-2.1.1 Least Connections Connection Forwarder
-This component tracks the number of connections per upstream and forwards incoming connections to the upstream with the least number of active connections. This ensures even distribution of the network load across all available upstreams.
+Here is a simplified high level diagram:
+```mermaid
+graph TD;
+  user(User) -->|mTLS| auth_scheme(Auth Scheme)
+  auth_scheme --> rate_limiter(Rate Limiter)
+  rate_limiter --> least_conn(Least Connection)
+  least_conn --> upstream1(Upstream 1)
+  least_conn --> upstream2(Upstream 2)
+  subgraph server[Server]
+    auth_scheme
+    rate_limiter
+    least_conn
+    subgraph forwarder[Forwarder]
+      rate_limiter
+      least_conn
+    end
+  end
+  class user person;
+```
 
-2.1.2 Per-Client Connection Rate Limiter
-This component limits the rate of connections from individual clients to prevent overload on the upstream servers. It monitors the connection rate from each client and applies rate limiting policies as necessary.
+## Requirements
+- certificates for the client are generated my the same instance as for the server. That permits to set the CN values adequately.
+- the CN format used is the host name + domain name
 
-2.2 Server
-The server component acts as the interface for clients to interact with the load balancer. It provides secure communication channels using mutual TLS (mTLS) authentication for both clients and servers. Additionally, it includes a simple authorization scheme to define which upstreams are available to which clients.
+## Load balancer library
+The load balancer library will contain the core logic for distributing incoming requests across backend servers. It will:
+- provide methods to forward a TCP connection to the upstream servers of the load balancer
+- use a least connection algorithm which means we will keep track of the usage of the upstream servers
+- rate limit the connections based on the client usage
 
-2.2.1 mTLS Authentication
-The server implements mutual TLS authentication to verify the identity of both clients and servers. This ensures secure communication channels between the clients and the load balancer.
+### Connection forwarder
+The forwarder maintains a list of connections opened towards the upstream servers. It will forward incoming TCP connections to the least used upstream server based on the least connection algorithm.
 
-2.2.2 Authorization Scheme
-A simple authorization scheme is implemented to determine which clients have access to which upstreams. This scheme can be statically defined in the code, mapping clients to authorized upstreams based on predefined rules.
+The forwarder provides 2 public methods
+```go
+type Forwarder struct {
+	upstreams map[string]int
+	mu        sync.Mutex
+}
+func NewForwarder(upstreams []string) *Forwarder {}
+func (f *Forwarder) Forward(src net.Conn, allowedUpstreams []string) {}
+```
 
-2.2.3 Connection Handling
-The server accepts incoming connections from clients and forwards them to the appropriate upstream using the functionality provided by the library component. It manages the communication flow between clients and upstreams, ensuring proper load balancing and rate limiting.
+The map of upstreams containing the connections count uses a mutex to make it thread safe.
 
-3. Architecture
-3.1 High-Level Architecture
-The high-level architecture explains how requests are redirected to the server with the fewest active connections, requiring additional computation by the load balancer to identify less-busy servers.
+Note: the usage of mutex can be replaced by using channels.
+Some advantages of mutex are 
+- simpler implementation
+- light weight locking
+- low memory overhead
+Channels would permit passing parameters using them and can permit multiple consumers and producers concurrently which is not needed here.
+That choice can be made during implementation.
 
+After finding the least used upstream server, it increments the count and opens a new connection towards that server. It copies the data from the client connection to the upstream connection and vice versa using `io.Copy`.
 
-Client: Initiates connections to the load balancer.
-Server: Accepts incoming connections from clients and forwards them to the appropriate upstream.
-Library: Implements load balancing and rate limiting functionality.
-Upstreams: Backend servers that handle the actual workload.
-3.2 Communication Flow
-Client Connection: Clients establish a connection to the server component of the load balancer.
-Authentication: Mutual TLS authentication is performed between the client and the server to verify identities.
-Authorization: The server checks the authorization of the client and determines which upstreams are accessible.
-Connection Forwarding: The server forwards incoming connections to the appropriate upstream based on load balancing algorithms implemented in the library.
-Rate Limiting: The library component applies per-client connection rate limiting policies to prevent overload on the upstream servers.
-Data Transmission: Data is transmitted between the client and the selected upstream server.
+Copying the data in 2 different goroutines (one from client to server, one from server to client) ensures non blocking behavior.
 
+The forwarder manages the connections availability by using a retry mechanism. If connecting to the selected upstream fails, it will try the next least used server until it succeeds or exhausts the allowed upstreams list.
 
-4. Implementation Considerations
-4.1 Language and Framework
-The load balancer and server components will be implemented using a suitable programming language such as Python, Go, or Java. Standard libraries and frameworks will be utilized for implementing TLS, authorization, and communication protocols.
+Each time an upstream connection is found not responsive, it is added to a list of "unhealthy" upstreams for a period of time before being removed. This prevents constantly retrying failing servers.
 
-4.2 Load Balancing Algorithms
-The library component will implement a least connections connection forwarder algorithm to distribute incoming connections evenly across upstream servers. Other load balancing algorithms such as round-robin or weighted round-robin may be implemented based on future requirements.
+### Rate limiter
+The rate limiter discards connection if the client makes too many connections for an amount of time. The client will be identified by the CN value in the certificate or part of it.
 
-4.3 Rate Limiting Mechanism
-The per-client connection rate limiter will be implemented in the library component using appropriate data structures and algorithms to track and limit connection rates effectively.
+I will use the `token bucket` algorithm implemented in package `x/time/rate` for its smooth nature and simplicity to implement and demonstrate. It permits to define a burst of connections and will have a max connections per second refill of the "bucket". 
 
-4.4 Security Measures
-Strict security measures, including mutual TLS authentication and authorization, will be implemented to ensure secure communication channels and access control between clients and the load balancer.
+To demonstrate that feature easily I will use a bucket size of `3` and a rate of `1`.
 
-4.5 Scalability and Performance
-The load balancer will be designed for scalability and high performance to handle a large number of concurrent connections efficiently. Performance testing and optimization will be conducted to ensure optimal performance under varying load conditions.
+The public functions of the rate limiter are:
+```go
+type Ratelimiter struct {
+	clients map[string]*client
+	burst   int
+	rate    int
+    mu      sync.Mutex
+}
+func NewRateLimiter(burst, rate int) *Ratelimiter {}
+func (r *Ratelimiter) Allow(clientId string) bool {}
+```
+## Server
+The server uses the forwarder library and appends security.
+### Secured communication
+#### Authentication
+The server uses mutual TLS for authentication. Clients will need to provide a valid client certificate during the TLS handshake.
 
-5. Conclusion
-This design document provides an overview of the architecture and implementation considerations for a basic TCP load balancer. By implementing load balancing and rate limiting functionality in a reusable library and providing secure communication channels and authorization layers in the server component, the load balancer will efficiently distribute network load while ensuring security and scalability.
-This document outlines the design and architecture of a basic TCP load balancer. The load balancer is designed to distribute network load across multiple hosts (or upstreams) efficiently. The project consists of two main components: a reusable library implementing load balancing functionality and a server that exposes the library functionality, providing secure communication to clients and an authorization layer.
+In Mutual TLS, the server requests the client to provide a digital certificate which contains the client's public key and identity information. The server verifies the client's certificate by checking its authenticity and ensuring it is signed by a trusted Certificate Authority (CA) that the server recognizes. This confirms the client's identity.
+The server also provides its own certificate to the client during TLS handshake. The client verifies the server certificate similarly. This establishes mutual authentication between the client and server.
 
-2. Components
-2.1 Library
-The library component implements the core functionality of the load balancer. It includes two main features: least connections connection forwarder and per-client connection rate limiter.
+Certificate rotation is supported by generating new certificates periodically and distributing them to clients. The certificates are distributed before they expire to ensure smooth rotation. When a new certificate is received, the client stops using the old certificate and it can be put in a revocation list. The CRL can be checked by clients during certificate validation and both certificates can be used before using that list.
+##### Certificate configuration
+The server and client certificates must use the same Certificate Authority.
+```
+# Generate CA cert
+openssl genrsa -aes256 -out ca/ca.key 4096 
+openssl req -new -x509 -sha256 -days 20 -key ca/ca.key -out ca/ca.crt
 
-2.1.1 Least Connections Connection Forwarder
-This component tracks the number of connections per upstream and forwards incoming connections to the upstream with the least number of active connections. This ensures even distribution of the network load across all available upstreams.
+# Generate CSR for server
+openssl genrsa -out server/localhost.key 2048
+openssl req -new -key server/localhost.key -sha256 -out server/localhost.csr
+# Validate CSR
+openssl x509 -req -days 365 -sha256 -in server/localhost.csr -CA ca/ca.crt -CAkey ca/ca.key -set_serial 1 -out server/localhost.crt
 
-2.1.2 Per-Client Connection Rate Limiter
-This component limits the rate of connections from individual clients to prevent overload on the upstream servers. It monitors the connection rate from each client and applies rate limiting policies as necessary.
+# Create client CRT
+openssl genrsa -out client/client1.key 2048
+openssl req -new -key client/client1.key -out client/client1.csr
+# Validate CSR
+openssl x509 -req -days 365 -sha256 -in client/client1.csr -CA ca/ca.crt -CAkey ca/ca.key -set_serial 2 -out client/client1.crt
+```
 
-2.2 Server
-The server component acts as the interface for clients to interact with the load balancer. It provides secure communication channels using mutual TLS (mTLS) authentication for both clients and servers. Additionally, it includes a simple authorization scheme to define which upstreams are available to which clients.
+#### TLS versions
+We will support TLS 1.2 and 1.3 for the communication between clients and server. It removes a lot of unsecure or deprecated TLS features and provides better security. I found out that an estimate of 20% of corporate internet traffic is using TLS 1.3 in 2023 and adding TLS 1.2 will cover the most secure enough clients possible. 
 
-2.2.1 mTLS Authentication
-The server implements mutual TLS authentication to verify the identity of both clients and servers. This ensures secure communication channels between the clients and the load balancer.
+#### Cipher suites
+A cipher suite consists of a key exchange algorithm, an authentication algorithm, a bulk encryption algorithm, and a message authentication algorithm.
 
-2.2.2 Authorization Scheme
-A simple authorization scheme is implemented to determine which clients have access to which upstreams. This scheme can be statically defined in the code, mapping clients to authorized upstreams based on predefined rules.
-
-2.2.3 Connection Handling
-The server accepts incoming connections from clients and forwards them to the appropriate upstream using the functionality provided by the library component. It manages the communication flow between clients and upstreams, ensuring proper load balancing and rate limiting.
-
-3. Architecture
-3.1 High-Level Architecture
-The high-level architecture explains how requests are redirected to the server with the fewest active connections, requiring additional computation by the load balancer to identify less-busy servers.
-
-                           +-------------------------+
-                           |          Client         |
-                           +-----------+-------------+
-                                         |
-                                         v
-                         +-------------------------------+
-                         |            Server             |
-                         +-------------+-----------------+
-                                      |
-                                      v
-        +-----------------------------+------------------------------+
-        |           Authorization & Authentication Layer           |
-        +-----------------------------+------------------------------+
-                                      |
-                                      v
-                            +---------------------+    
-                            |   Load Balancer     |
-                            +-----------+---------+
-                                      |
-                                      v
-                      ----------------------------------------------------------------
-                      | req3,                        |                                   |
-                      v req4                         v                                   v
-+--------------------------------+   +--------------------------------+ +--------------------------------+
-|        10 Connections          |   |        80 Conenctions          | |        80 Connections          |
-+--------------------------------+   +--------------------------------+ +--------------------------------+
-    Req1, req2 completed
+The following cipher suites can be used from must secure to less secure: 
+1. ECDHE-ECDSA-AES256-GCM-SHA384
+2. ECDHE-RSA-AES256-GCM-SHA384
+3. ECDHE-ECDSA-CHACHA20-POLY1305
+4. ECDHE-RSA-CHACHA20-POLY1305
+5. ECDHE-ECDSA-AES128-GCM-SHA256
+6. ECDHE-RSA-AES128-GCM-SHA256
 
 
-Client: Initiates connections to the load balancer.
-Server: Accepts incoming connections from clients and forwards them to the appropriate upstream.
-Library: Implements load balancing and rate limiting functionality.
-Upstreams: Backend servers that handle the actual workload.
+#### Configuration
+We can use [Mozilla SSL Config Generator](https://ssl-config.mozilla.org/#server=go&version=1.21&config=intermediate&guideline=5.7) with the intermediate configuration and extract the Go TLS configuration as follows
+```
+cfg := &tls.Config{
+    MinVersion: tls.VersionTLS12,
+    CipherSuites: []uint16{
+        tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+        tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+        tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+        tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+    },
+}
+```
+### Authorization scheme
+#### Principle
+A list is created in the server with the upstreams associated to each client. This list is passed to the forward method who will verify if the upstream selected is in the list passed for the client. The upstreams list and the client's accessible upstream list are created by the same layer so if the list is empty we do not forward the request and close the connection.
 
-3.2 Communication Flow
-Client Connection: Clients establish a connection to the server component of the load balancer.
-Authentication: Mutual TLS authentication is performed between the client and the server to verify identities.
-Authorization: The server checks the authorization of the client and determines which upstreams are accessible.
-Connection Forwarding: The server forwards incoming connections to the appropriate upstream based on load balancing algorithms implemented in the library.
-Rate Limiting: The library component applies per-client connection rate limiting policies to prevent overload on the upstream servers.
-Data Transmission: Data is transmitted between the client and the selected upstream server.
+For example the list will be passed like that:
+```go
+upstreams := []string{"localhost:9001", "localhost:9002"}
+go forwarder.Forward(clientConn, upstreams)
+```
 
-4. Implementation Considerations
-4.1 Language and Framework
-The load balancer and server components will be implemented using a suitable programming language such as Python, Go, or Java. Standard libraries and frameworks will be utilized for implementing TLS, authorization, and communication protocols.
+The way to determine the client is the subject.CommonName field of the certificate. The certificate needs to have that information correctly filled so that we can identify it and authorize it.
 
-4.2 Load Balancing Algorithms
-The library component will implement a least connections connection forwarder algorithm to distribute incoming connections evenly across upstream servers. Other load balancing algorithms such as round-robin or weighted round-robin may be implemented based on future requirements.
+### User experience
+#### Client
+We can simulate the client user experience by using `curl` in the background and use the different certificates alternatively.
+```sh
+curl --cert client.crt --key client.key --cacert ca.crt https://myserver.internal.net:443 &
+```
+I will maintain a shell script that launches them parallely.
 
-4.3 Rate Limiting Mechanism
-The per-client connection rate limiter will be implemented in the library component using appropriate data structures and algorithms to track and limit connection rates effectively.
+#### Server
+The server can be launched with an executable file. There will be a main file that uses the modules accordingly.
 
-4.4 Security Measures
-Strict security measures, including mutual TLS authentication and authorization, will be implemented to ensure secure communication channels and access control between clients and the load balancer.
+A Dockerfile will be provided to be able to start the server in a containerized environment. This makes it easy to run and deploy.
+#### Testing
+The upstreams side can be simulated with several `nginx` servers running in `docker`. Reading the access logs of the servers will give us an idea of the load balancing accuracy.
 
-4.5 Scalability and Performance
-The load balancer will be designed for scalability and high performance to handle a large number of concurrent connections efficiently. Performance testing and optimization will be conducted to ensure optimal performance under varying load conditions.
+## Trade Offs
+Here is a list of trade offs/assumptions used for the design of the solution: 
 
-5. Conclusion
-This design document provides an overview of the architecture and implementation considerations for a basic TCP load balancer. By implementing load balancing and rate limiting functionality in a reusable library and providing secure communication channels and authorization layers in the server component, the load balancer will efficiently distribute network load while ensuring security and scalability.
+- to have a better security, I will discard SSL and TLS before 1.2
+- for the sake of the exercise, the list of upstreams is hard coded
+- for the sake of the exercise, the rate limit is hard coded
+- the number of clients is considered small enough to not have to clean the clients list after a period of time
