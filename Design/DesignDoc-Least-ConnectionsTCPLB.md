@@ -10,7 +10,31 @@ Here is a simplified high level diagram:
 ```mermaid
 graph TD;
   user(User) -->|mTLS| auth_scheme(Auth Scheme)
-  auth_scheme --> rate_limiter(Rate Limiter)
+  auth_schemepackage server
+
+type AuthScheme struct {
+	allowedClients map[string][]string // client ID -> allowed upstreams
+}
+
+func NewAuthScheme() *AuthScheme {
+	m := make(map[string][]string)
+	return &AuthScheme{
+		allowedClients: m,
+	}
+}
+
+func (a *AuthScheme) AllowClient(clientID string, upstreams []string) {
+	a.allowedClients[clientID] = upstreams
+}
+
+func (a *AuthScheme) GetAllowedUpstreams(clientID string) []string {
+	allowed, ok := a.allowedClients[clientID]
+	if !ok {
+		return nil
+	}
+	return allowed
+}
+ --> rate_limiter(Rate Limiter)
   rate_limiter --> least_conn(Least Connection)
   least_conn --> upstream1(Upstream 1)
   least_conn --> upstream2(Upstream 2)
