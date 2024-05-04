@@ -1,0 +1,11 @@
+version: "2"
+services:
+  webapp1:
+    image: nginx
+    ports:
+      - 9801:80
+
+  webapp2:
+    image: nginx
+    ports:
+      - 9802:80

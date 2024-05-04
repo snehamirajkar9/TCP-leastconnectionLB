@@ -1,0 +1,34 @@
+version: "3"
+services:
+
+  webapp1:
+    image: nginx
+    ports:
+      - 80
+    networks:
+      - backend
+
+  webapp2:
+    image: nginx
+    ports:
+      - 80
+    networks:
+      - backend
+
+  loadbalancer:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - 9443:9443
+    depends_on:
+      webapp1:
+        condition: service_started
+      webapp2:
+        condition: service_started
+    networks:
+      - backend
+
+networks:
+  backend:
+    name: backend
